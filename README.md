@@ -36,7 +36,7 @@ KeyRemap 把**好的那一排**（`Q W E R T Y U I O P [ ]`，共 12 个键）�
 
 ### 下载
 
-到 [Releases](https://github.com/Canny345/KeyRemap/releases) 下载 `KeyRemap.exe`，双击运行即可。
+到 [Releases](https://github.com/Canny345/KeyReMap/releases) 下载 `KeyRemap.exe`，双击运行即可。
 
 **单文件、零依赖** —— 不需要安装 .NET、AutoHotkey 或任何运行库，约 160 KB。
 
