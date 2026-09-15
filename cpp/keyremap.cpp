@@ -23,11 +23,14 @@
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "gdiplus.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "imm32.lib")   // 设置窗口需要禁用输入法关联
 
 // ============================== 配置区 ==============================
-static const UINT  kHotkeyMods = MOD_CONTROL | MOD_ALT;
-static const UINT  kHotkeyVK   = 'M';
-static const WCHAR* kHotkeyName = L"Ctrl+Alt+M";
+// 切换热键：默认 Ctrl+Alt+M。可在托盘菜单「设置热键」里改，保存在 exe 同目录的 KeyRemap.ini
+static UINT         g_hotkeyMods = MOD_CONTROL | MOD_ALT;
+static UINT         g_hotkeyVK   = 'M';
+static std::wstring g_hotkeyName = L"Ctrl+Alt+M";
+static const WCHAR* kIniName     = L"KeyRemap.ini";
 
 // 提示框外观：全部按屏幕比例计算，自动适配任意分辨率 / 缩放 / 显示器
 static const double kWidthRatio = 0.29;   // 宽度 = 工作区宽度的 29%
@@ -79,6 +82,7 @@ enum {
     WM_TRAYMSG  = WM_APP + 1,
     IDM_TOGGLE  = 1000,
     IDM_EXIT    = 1001,
+    IDM_SETTINGS = 1002,
 };
 
 // ============================== 全局状态 ==============================
@@ -97,6 +101,15 @@ static bool  g_toastVisible = false;
 static std::wstring g_lastToastText;
 
 static NOTIFYICONDATAW g_nid = {};
+static HWND  g_hDlg = nullptr;         // 热键设置窗口（非空表示正在设置）
+
+// 修饰键的物理状态，由键盘钩子维护。
+// 钩子位于输入最前端，能拿到"按键发生那一刻"的真实状态；
+// 而窗口收到 WM_KEYDOWN 时修饰键往往已经松开了，那时再查 GetAsyncKeyState 会读丢。
+static bool g_modCtrl  = false;
+static bool g_modShift = false;
+static bool g_modAlt   = false;
+static bool g_modWin   = false;
 
 // ============================== 工具函数 ==============================
 static std::wstring Fmt(const WCHAR* fmt, ...) {
@@ -105,6 +118,61 @@ static std::wstring Fmt(const WCHAR* fmt, ...) {
     _vsnwprintf_s(buf, _countof(buf), _TRUNCATE, fmt, ap);
     va_end(ap);
     return std::wstring(buf);
+}
+
+// ---------------- 热键名称与配置 ----------------
+static std::wstring VkName(UINT vk) {
+    if (vk >= 'A' && vk <= 'Z') return std::wstring(1, (WCHAR)vk);
+    if (vk >= '0' && vk <= '9') return std::wstring(1, (WCHAR)vk);
+    if (vk >= VK_F1 && vk <= VK_F24) return Fmt(L"F%d", vk - VK_F1 + 1);
+    switch (vk) {
+    case VK_OEM_1: return L";";      case VK_OEM_PLUS:   return L"=";
+    case VK_OEM_COMMA: return L",";  case VK_OEM_MINUS:  return L"-";
+    case VK_OEM_PERIOD: return L"."; case VK_OEM_2:      return L"/";
+    case VK_OEM_3: return L"`";      case VK_OEM_4:      return L"[";
+    case VK_OEM_5: return L"\\";     case VK_OEM_6:      return L"]";
+    case VK_OEM_7: return L"'";
+    case VK_SPACE: return L"Space";      case VK_TAB:    return L"Tab";
+    case VK_ESCAPE: return L"Esc";       case VK_RETURN: return L"Enter";
+    case VK_BACK: return L"Backspace";   case VK_DELETE: return L"Delete";
+    case VK_INSERT: return L"Insert";    case VK_HOME:   return L"Home";
+    case VK_END: return L"End";          case VK_PRIOR:  return L"PgUp";
+    case VK_NEXT: return L"PgDn";
+    default: return Fmt(L"VK%02X", vk);
+    }
+}
+
+static std::wstring HotkeyName(UINT mods, UINT vk) {
+    std::wstring s;
+    if (mods & MOD_CONTROL) s += L"Ctrl+";
+    if (mods & MOD_ALT)     s += L"Alt+";
+    if (mods & MOD_SHIFT)   s += L"Shift+";
+    if (mods & MOD_WIN)     s += L"Win+";
+    s += VkName(vk);
+    return s;
+}
+
+static std::wstring IniPath() {
+    WCHAR buf[MAX_PATH] = {};
+    GetModuleFileNameW(nullptr, buf, MAX_PATH);
+    std::wstring p(buf);
+    const size_t pos = p.find_last_of(L"\\/");
+    if (pos != std::wstring::npos) p.resize(pos + 1);
+    return p + kIniName;
+}
+
+static void LoadConfig() {
+    const std::wstring ini = IniPath();
+    const UINT m = (UINT)GetPrivateProfileIntW(L"Hotkey", L"Mods", MOD_CONTROL | MOD_ALT, ini.c_str());
+    const UINT v = (UINT)GetPrivateProfileIntW(L"Hotkey", L"VK", 'M', ini.c_str());
+    if (m != 0 && v != 0) { g_hotkeyMods = m; g_hotkeyVK = v; }
+    g_hotkeyName = HotkeyName(g_hotkeyMods, g_hotkeyVK);
+}
+
+static void SaveConfig() {
+    const std::wstring ini = IniPath();
+    WritePrivateProfileStringW(L"Hotkey", L"Mods", Fmt(L"%u", g_hotkeyMods).c_str(), ini.c_str());
+    WritePrivateProfileStringW(L"Hotkey", L"VK",   Fmt(L"%u", g_hotkeyVK).c_str(),   ini.c_str());
 }
 
 // 发送目标按键。dwExtraInfo 打上标记，钩子里据此忽略"自己发出"的事件，
@@ -121,7 +189,20 @@ static void SendKey(int vk, bool isDown) {
     SendInput(1, &in, sizeof(INPUT));
 }
 
-static bool IsShiftDown() { return (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0; }
+static bool IsModifierKey(UINT vk) {
+    return vk == VK_CONTROL || vk == VK_LCONTROL || vk == VK_RCONTROL
+        || vk == VK_SHIFT   || vk == VK_LSHIFT   || vk == VK_RSHIFT
+        || vk == VK_MENU    || vk == VK_LMENU    || vk == VK_RMENU
+        || vk == VK_LWIN    || vk == VK_RWIN;
+}
+
+// 是否按住了会"占据"按键的组合修饰键。
+// 只有裸键（可带 Shift）才做映射；按住 Ctrl / Alt / Win 时一律放行，
+// 免得把 Ctrl+W（关标签页）、Ctrl+R（刷新）这类浏览器快捷键吃掉。
+// Shift 不算，因为数字模式需要 Shift+W 打出 @。
+static bool ModifierBlocksMapping() {
+    return g_modCtrl || g_modAlt || g_modWin;
+}
 
 // 计算提示框几何尺寸：以工作区为基准按比例算，换任何机器都自适应
 static void ComputeGeometry() {
@@ -263,7 +344,7 @@ static void SetTrayIcon() {
     if (g_nid.hIcon) DestroyIcon(g_nid.hIcon);
     g_nid.hIcon = ic;
     wcsncpy_s(g_nid.szTip, Fmt(L"按键映射 · %s模式（%s 切换）",
-                               kModeName[g_mode], kHotkeyName).c_str(), _TRUNCATE);
+                               kModeName[g_mode], g_hotkeyName.c_str()).c_str(), _TRUNCATE);
     Shell_NotifyIconW(NIM_MODIFY, &g_nid);
 }
 
@@ -281,16 +362,155 @@ static void ShowTrayMenu() {
     POINT pt; GetCursorPos(&pt);
     HMENU m = CreatePopupMenu();
     const std::wstring head = Fmt(L"当前模式：%s", kModeName[g_mode]);
-    const std::wstring item = Fmt(L"切换模式   (%s)", kHotkeyName);
+    const std::wstring item = Fmt(L"切换模式   (%s)", g_hotkeyName.c_str());
     AppendMenuW(m, MF_STRING | MF_DISABLED, 0, head.c_str());
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING, IDM_TOGGLE, item.c_str());
+    AppendMenuW(m, MF_STRING, IDM_SETTINGS, L"设置热键…");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING, IDM_EXIT, L"退出");
 
     SetForegroundWindow(g_hwnd);
     TrackPopupMenu(m, TPM_RIGHTBUTTON, pt.x, pt.y, 0, g_hwnd, nullptr);
     DestroyMenu(m);
+}
+
+// ============================== 热键设置 ==============================
+static bool ApplyHotkey() {
+    UnregisterHotKey(g_hwnd, 1);
+    if (!RegisterHotKey(g_hwnd, 1, g_hotkeyMods, g_hotkeyVK))
+        return false;
+    g_hotkeyName = HotkeyName(g_hotkeyMods, g_hotkeyVK);
+    SetTrayIcon();
+    return true;
+}
+
+enum { IDC_CAP = 2001, IDC_SAVE, IDC_CANCEL };
+
+static HWND g_hCap   = nullptr;
+static UINT g_capMods = 0;
+static UINT g_capVK   = 0;
+
+static void UpdateCapText() {
+    if (!g_hCap) return;
+    SetWindowTextW(g_hCap, g_capVK ? HotkeyName(g_capMods, g_capVK).c_str() : L"请按下热键…");
+}
+
+static LRESULT CALLBACK DlgProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_KEYDOWN:
+    case WM_SYSKEYDOWN: {
+        const UINT vk = (UINT)wp;
+        // 中文输入法激活时，按键会先被输入法吃掉，窗口只能收到 VK_PROCESSKEY。
+        // 正常路径已用 ImmAssociateContext 断开关联，这里再兜一道。
+        if (vk == VK_PROCESSKEY) return 0;
+        if (IsModifierKey(vk)) {
+            // 只按了修饰键：显示当前按住哪些，并清掉上一次捕获的主键
+            g_capVK   = 0;
+            g_capMods = (g_modCtrl  ? MOD_CONTROL : 0) | (g_modShift ? MOD_SHIFT : 0)
+                      | (g_modAlt   ? MOD_ALT     : 0) | (g_modWin   ? MOD_WIN   : 0);
+        }
+        // 主键的组合已由钩子在按键发生那一刻记录，这里只负责刷新显示
+        UpdateCapText();
+        return 0;
+    }
+    case WM_COMMAND:
+        if (LOWORD(wp) == IDC_SAVE) {
+            if (g_capVK == 0 || (g_capMods & (MOD_CONTROL | MOD_ALT | MOD_WIN)) == 0) {
+                MessageBoxW(h,
+                    L"热键必须包含 Ctrl、Alt、Win 中的至少一个。\n"
+                    L"只按 Shift 或不带修饰键会与正常打字冲突。",
+                    L"KeyRemap", MB_ICONWARNING);
+                return 0;
+            }
+            const UINT oldMods = g_hotkeyMods, oldVK = g_hotkeyVK;
+            g_hotkeyMods = g_capMods;
+            g_hotkeyVK   = g_capVK;
+            if (!ApplyHotkey()) {
+                g_hotkeyMods = oldMods;
+                g_hotkeyVK   = oldVK;
+                ApplyHotkey();    // 换回原来的
+                MessageBoxW(h, L"该热键已被其他程序占用，请换一个。", L"KeyRemap", MB_ICONERROR);
+                return 0;
+            }
+            SaveConfig();
+            DestroyWindow(h);
+            return 0;
+        }
+        if (LOWORD(wp) == IDC_CANCEL) { DestroyWindow(h); return 0; }
+        return 0;
+    case WM_CLOSE:
+        DestroyWindow(h);
+        return 0;
+    case WM_DESTROY:
+        g_hDlg = nullptr;
+        g_hCap = nullptr;
+        return 0;
+    }
+    return DefWindowProcW(h, msg, wp, lp);
+}
+
+static void ShowSettingsDialog() {
+    if (g_hDlg) { SetForegroundWindow(g_hDlg); return; }
+
+    const int scale = (int)(GetDpiForSystem() * 100 / 96);   // 百分比
+    auto px = [scale](int v) { return v * scale / 100; };
+
+    // 先定客户区大小，再用 AdjustWindowRectEx 加上标题栏/边框，
+    // 否则窗口高度不够会把底部的按钮裁掉
+    const DWORD dlgStyle = WS_POPUP | WS_CAPTION | WS_SYSMENU;
+    RECT rc = { 0, 0, px(440), px(205) };
+    AdjustWindowRectEx(&rc, dlgStyle, FALSE, WS_EX_TOPMOST);
+    const int W = rc.right - rc.left;
+    const int H = rc.bottom - rc.top;
+
+    RECT wa = {};
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
+    const int X = wa.left + ((wa.right - wa.left) - W) / 2;
+    const int Y = wa.top + ((wa.bottom - wa.top) - H) / 2;
+
+    g_hDlg = CreateWindowExW(WS_EX_TOPMOST, L"KeyRemapDlgClass", L"设置切换热键",
+                             dlgStyle, X, Y, W, H, nullptr, nullptr, g_hInst, nullptr);
+    if (!g_hDlg) return;
+
+    // 断开输入法关联：否则中文输入法会把按键截走，窗口只能收到 VK_PROCESSKEY，
+    // 导致热键捕获框显示成 "VKE5" 之类的东西
+    ImmAssociateContext(g_hDlg, nullptr);
+
+    HFONT hf = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+    auto mk = [&](const WCHAR* cls, const WCHAR* text, DWORD style,
+                  int x, int y, int w, int hh, int id, HFONT font) {
+        HWND c = CreateWindowExW(0, cls, text, WS_CHILD | WS_VISIBLE | style,
+                                 px(x), px(y), px(w), px(hh),
+                                 g_hDlg, (HMENU)(INT_PTR)id, g_hInst, nullptr);
+        SendMessageW(c, WM_SETFONT, (WPARAM)(font ? font : hf), TRUE);
+        return c;
+    };
+
+    mk(L"STATIC", L"请按下新的热键组合（须含 Ctrl / Alt / Win 之一）：",
+       SS_LEFT, 20, 16, 400, 22, 0, nullptr);
+
+    HFONT hBig = CreateFontW(-px(24), 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET,
+                             OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                             DEFAULT_PITCH, L"Microsoft YaHei");
+    g_hCap = mk(L"STATIC", L"", SS_CENTER | SS_CENTERIMAGE | WS_BORDER,
+                20, 46, 400, 50, IDC_CAP, hBig);
+
+    const std::wstring cur = Fmt(L"当前热键：%s", g_hotkeyName.c_str());
+    mk(L"STATIC", cur.c_str(), SS_LEFT, 20, 108, 400, 22, 0, nullptr);
+    mk(L"STATIC", L"保存后立即生效，并写入 exe 同目录的 KeyRemap.ini",
+       SS_LEFT, 20, 132, 400, 22, 0, nullptr);
+
+    mk(L"BUTTON", L"保存", BS_DEFPUSHBUTTON, 220, 166, 95, 32, IDC_SAVE,   nullptr);
+    mk(L"BUTTON", L"取消", BS_PUSHBUTTON,     325, 166, 95, 32, IDC_CANCEL, nullptr);
+
+    g_capMods = g_hotkeyMods;
+    g_capVK   = g_hotkeyVK;
+    UpdateCapText();
+
+    ShowWindow(g_hDlg, SW_SHOW);
+    SetForegroundWindow(g_hDlg);
+    SetFocus(g_hDlg);
 }
 
 // ============================== 模式切换 ==============================
@@ -329,16 +549,42 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
     // 注意不能用 LLKHF_INJECTED 一刀切，那会连带忽略其他程序注入的按键
     if (kb->dwExtraInfo == kInjectedTag)
         return CallNextHookEx(g_hook, nCode, wParam, lParam);
+
+    const int  vk     = (int)kb->vkCode;
+    const bool isDown = (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN);
+    const bool isUp   = (wParam == WM_KEYUP   || wParam == WM_SYSKEYUP);
+
+    // 维护修饰键物理状态（在输入最前端记录，最准确）
+    switch (vk) {
+    case VK_CONTROL: case VK_LCONTROL: case VK_RCONTROL: g_modCtrl  = isDown; break;
+    case VK_SHIFT:   case VK_LSHIFT:   case VK_RSHIFT:   g_modShift = isDown; break;
+    case VK_MENU:    case VK_LMENU:    case VK_RMENU:    g_modAlt   = isDown; break;
+    case VK_LWIN:    case VK_RWIN:                       g_modWin   = isDown; break;
+    }
+
+    // 设置窗口打开时：在"按键发生的那一刻"记录组合键，供其捕获
+    if (g_hDlg != nullptr) {
+        if (isDown && !IsModifierKey(vk)) {
+            g_capMods = (g_modCtrl  ? MOD_CONTROL : 0) | (g_modShift ? MOD_SHIFT : 0)
+                      | (g_modAlt   ? MOD_ALT     : 0) | (g_modWin   ? MOD_WIN   : 0);
+            g_capVK = vk;
+        }
+        return CallNextHookEx(g_hook, nCode, wParam, lParam);   // 设置期间不干预键盘
+    }
+
     if (g_mode == MODE_NORMAL)
         return CallNextHookEx(g_hook, nCode, wParam, lParam);
 
-    const int vk = (int)kb->vkCode;
     auto it = g_curMap.find(vk);
+
+    // 按下时若带着 Ctrl / Alt / Win，放行给系统，保住 Ctrl+W、Ctrl+R 这类组合键。
+    // 但"松开"必须照常处理 —— 否则之前注入的目标键会卡住不释放。
+    if (isDown && ModifierBlocksMapping())
+        return CallNextHookEx(g_hook, nCode, wParam, lParam);
+
     if (it == g_curMap.end())
         return CallNextHookEx(g_hook, nCode, wParam, lParam);
 
-    const bool isDown = (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN);
-    const bool isUp   = (wParam == WM_KEYUP   || wParam == WM_SYSKEYUP);
     const int  target = it->second;
 
     if (isDown) {
@@ -350,7 +596,7 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
                 const WCHAR* shown = kShiftSym[i];
                 // 功能模式不受 Shift 影响，显示 F 键名
                 std::wstring dst = (g_mode == MODE_NUM)
-                    ? std::wstring(IsShiftDown() ? shown : L"")
+                    ? std::wstring(g_modShift ? shown : L"")
                     : std::wstring();
                 if (dst.empty()) {
                     if (g_mode == MODE_NUM) {
@@ -389,11 +635,12 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
 static LRESULT CALLBACK MsgWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_HOTKEY:
-        if (wp == 1) CycleMode();
+        if (wp == 1 && g_hDlg == nullptr) CycleMode();   // 设置窗口开着时不响应
         return 0;
 
     case WM_COMMAND:
         if (LOWORD(wp) == IDM_TOGGLE) CycleMode();
+        else if (LOWORD(wp) == IDM_SETTINGS) ShowSettingsDialog();
         else if (LOWORD(wp) == IDM_EXIT) DestroyWindow(h);
         return 0;
 
@@ -455,14 +702,33 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
         twc.lpszClassName, L"", WS_POPUP, 0, 0, 10, 10, nullptr, nullptr, hInst, nullptr);
     if (!g_hToast) return 1;
 
+    // 热键设置窗口
+    WNDCLASSEXW dwc = { sizeof(WNDCLASSEXW) };
+    dwc.lpfnWndProc   = DlgProc;
+    dwc.hInstance     = hInst;
+    dwc.hCursor       = LoadCursorW(nullptr, IDC_ARROW);
+    dwc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    dwc.lpszClassName = L"KeyRemapDlgClass";
+    RegisterClassExW(&dwc);
+
     AddTray();
 
-    if (!RegisterHotKey(g_hwnd, 1, kHotkeyMods, kHotkeyVK)) {
+    LoadConfig();
+    if (!ApplyHotkey()) {
+        // 配置里的热键被占用时，退回默认值再试一次
+        const std::wstring failed = g_hotkeyName;
+        g_hotkeyMods = MOD_CONTROL | MOD_ALT;
+        g_hotkeyVK   = 'M';
+        if (!ApplyHotkey()) {
+            MessageBoxW(nullptr,
+                L"热键 Ctrl+Alt+M 已被其他程序占用，程序退出。\n"
+                L"请关闭占用该热键的程序后重试。",
+                L"KeyRemap", MB_ICONERROR);
+            return 1;
+        }
         MessageBoxW(nullptr,
-            Fmt(L"热键 %s 已被其他程序占用，程序退出。\n请修改源码中的 kHotkeyVK / kHotkeyMods 后重新编译。",
-                kHotkeyName).c_str(),
-            L"KeyRemap", MB_ICONERROR);
-        return 1;
+            Fmt(L"配置中的热键 %s 已被占用，已退回默认的 Ctrl+Alt+M。", failed.c_str()).c_str(),
+            L"KeyRemap", MB_ICONWARNING);
     }
 
     g_hook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc, hInst, 0);
@@ -472,7 +738,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     }
 
     SetMode(MODE_NORMAL);
-    ShowToast(Fmt(L"正常模式 · %s 切换", kHotkeyName), 0, 2200);
+    ShowToast(Fmt(L"正常模式 · %s 切换", g_hotkeyName.c_str()), 0, 2200);
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {

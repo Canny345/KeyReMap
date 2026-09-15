@@ -14,3 +14,6 @@ tools/
 # 临时/日志文件
 *.log
 _syn.ahk
+
+# 运行期生成的配置文件
+KeyRemap.ini
