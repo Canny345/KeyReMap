@@ -1,0 +1,8 @@
+#include "resource.h"
+
+IDI_NORMAL ICON "../icons/normal.ico"
+IDI_NUM    ICON "../icons/num.ico"
+IDI_FUNC   ICON "../icons/func.ico"
+
+// 24 = RT_MANIFEST，声明 DPI 感知
+1 24 "keyremap.manifest"
