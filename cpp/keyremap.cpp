@@ -13,8 +13,10 @@
 #define _WIN32_WINNT 0x0A00
 #include <windows.h>
 #include <shellapi.h>
+#include <wtsapi32.h>    // WTSRegisterSessionNotification：订阅锁屏/解锁事件
 #include <gdiplus.h>
 #include <cstdarg>
+#include <cstdio>
 #include <string>
 #include <unordered_map>
 #include "resource.h"
@@ -23,7 +25,8 @@
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "gdiplus.lib")
 #pragma comment(lib, "shell32.lib")
-#pragma comment(lib, "imm32.lib")   // 设置窗口需要禁用输入法关联
+#pragma comment(lib, "imm32.lib")     // 设置窗口需要禁用输入法关联
+#pragma comment(lib, "wtsapi32.lib")  // 会话状态通知
 
 // ============================== 配置区 ==============================
 // 切换热键：默认 Ctrl+Alt+M。可在托盘菜单「设置热键」里改，保存在 exe 同目录的 KeyRemap.ini
@@ -152,13 +155,18 @@ static std::wstring HotkeyName(UINT mods, UINT vk) {
     return s;
 }
 
-static std::wstring IniPath() {
+// exe 所在目录（带结尾反斜杠）
+static std::wstring ExeDir() {
     WCHAR buf[MAX_PATH] = {};
     GetModuleFileNameW(nullptr, buf, MAX_PATH);
     std::wstring p(buf);
     const size_t pos = p.find_last_of(L"\\/");
     if (pos != std::wstring::npos) p.resize(pos + 1);
-    return p + kIniName;
+    return p;
+}
+
+static std::wstring IniPath() {
+    return ExeDir() + kIniName;
 }
 
 static void LoadConfig() {
@@ -631,6 +639,73 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
     return CallNextHookEx(g_hook, nCode, wParam, lParam);
 }
 
+// ============================== 输入通道的健壮性 ==============================
+//
+// 背景 —— 这是一个真实踩到的 bug：
+//   笔记本 Modern Standby（现代待机）睡一夜再唤醒后，模式提示还正常、托盘
+//   菜单也能用，但按键不再被映射：进程活着，钩子却"聋"了。
+//
+// 原因：Windows 会在两种情况下**静默卸载**低级键盘钩子，且不通知程序：
+//   1) 钩子回调超过 LowLevelHooksTimeout（默认 300ms）
+//   2) 系统为省电对后台进程做节流（EcoQoS）—— 进程被冻结则回调必然超时，
+//      于是钩子被摘掉
+//
+// 对策（两手都要，缺一不可）：
+//   A. 主动退出节能节流 —— 从源头避免被冻结
+//   B. 在电源/会话事件后重建钩子 —— 真被摘了也能自愈
+//
+// 只做 B 的话，每次唤醒后都有一段"聋"的窗口期；只做 A 的话，一旦因其他
+// 原因被摘（比如某次回调真超时了）就永久失效，只能重启程序。
+
+static void LogEvent(const std::wstring& text) {
+    // 只记录罕见事件（电源/会话变化、钩子重建），文件不会长起来。
+    // 这是必要的：钩子失效是**静默**的，没有日志就无从判断它是否复发。
+    const std::wstring path = ExeDir() + L"KeyRemap.log";
+    std::FILE* f = nullptr;
+    if (_wfopen_s(&f, path.c_str(), L"a, ccs=UTF-8") != 0 || f == nullptr) return;
+
+    SYSTEMTIME st = {};
+    GetLocalTime(&st);
+    std::fwprintf(f, L"[%04d-%02d-%02d %02d:%02d:%02d] %s\n",
+                  st.wYear, st.wMonth, st.wDay,
+                  st.wHour, st.wMinute, st.wSecond, text.c_str());
+    std::fclose(f);
+}
+
+// A. 退出节能节流：告诉系统"别为了省电冻结我"
+//    钩子回调有 300ms 的硬性预算，被冻结的进程根本跑不完回调。
+static void DisablePowerThrottling() {
+    PROCESS_POWER_THROTTLING_STATE pts = {};
+    pts.Version     = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+    pts.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+    pts.StateMask   = 0;    // 清位 = 不启用节流
+    SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling,
+                          &pts, sizeof(pts));
+}
+
+// B. 重建钩子（幂等：先卸旧的再装新的）
+static bool InstallHook() {
+    if (g_hook) {
+        UnhookWindowsHookEx(g_hook);
+        g_hook = nullptr;
+    }
+    g_hook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc, g_hInst, 0);
+    return g_hook != nullptr;
+}
+
+// 唤醒 / 解锁后调用：把输入通道整个重建一遍
+static void RecoverInput(const wchar_t* reason) {
+    const bool hookOk = InstallHook();
+    const bool hotkeyOk = ApplyHotkey();      // 热键注册也可能一起丢
+
+    // 按住状态可能已经和现实脱节，清掉并把补发的 keyup 放掉
+    for (auto& kv : g_held) SendKey(kv.second, false);
+    g_held.clear();
+
+    LogEvent(Fmt(L"%s -> hook=%s hotkey=%s", reason,
+                 hookOk ? L"ok" : L"FAILED", hotkeyOk ? L"ok" : L"FAILED"));
+}
+
 // ============================== 窗口过程 ==============================
 static LRESULT CALLBACK MsgWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
@@ -651,6 +726,31 @@ static LRESULT CALLBACK MsgWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_TIMER:
         if (wp == TIMER_TOAST) HideToast();
+        return 0;
+
+    // ---- 睡眠/唤醒 ----
+    // 这是修复「睡一夜后钩子失效」的关键：唤醒后主动重建输入通道
+    case WM_POWERBROADCAST:
+        switch (wp) {
+        case PBT_APMRESUMEAUTOMATIC:
+        case PBT_APMRESUMESUSPEND:
+        case PBT_APMRESUMECRITICAL:
+            RecoverInput(L"resume from sleep");
+            break;
+        }
+        return TRUE;
+
+    // ---- 会话状态变化（锁屏/解锁、切换用户）----
+    // 锁屏再解锁同样可能让钩子失效；切回本会话时也重建一次
+    case WM_WTSSESSION_CHANGE:
+        switch (wp) {
+        case WTS_SESSION_UNLOCK:
+            RecoverInput(L"session unlock");
+            break;
+        case WTS_CONSOLE_CONNECT:
+            RecoverInput(L"console connect");
+            break;
+        }
         return 0;
 
     case WM_DESTROY:
@@ -731,8 +831,13 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
             L"KeyRemap", MB_ICONWARNING);
     }
 
-    g_hook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc, hInst, 0);
-    if (!g_hook) {
+    // 退出节能节流：避免进程在 Modern Standby 后被冻结导致钩子被摘
+    DisablePowerThrottling();
+
+    // 订阅会话状态变化（锁屏/解锁、切换用户），用于唤醒后重建输入通道
+    WTSRegisterSessionNotification(g_hwnd, NOTIFY_FOR_THIS_SESSION);
+
+    if (!InstallHook()) {
         MessageBoxW(nullptr, L"安装键盘钩子失败，程序退出。", L"KeyRemap", MB_ICONERROR);
         return 1;
     }
@@ -740,13 +845,17 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     SetMode(MODE_NORMAL);
     ShowToast(Fmt(L"正常模式 · %s 切换", g_hotkeyName.c_str()), 0, 2200);
 
+    // 注意是 != 0 而不是 > 0：GetMessage 出错时返回 -1，
+    // 写成 > 0 会把"出错"当成"收到退出消息"而静默结束。
     MSG msg;
-    while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+    while (GetMessageW(&msg, nullptr, 0, 0) != 0) {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
 
     // 清理
+    WTSUnRegisterSessionNotification(g_hwnd);
+    UnregisterHotKey(g_hwnd, 1);
     if (g_hook) UnhookWindowsHookEx(g_hook);
     for (auto& kv : g_held) SendKey(kv.second, false);
     g_held.clear();
