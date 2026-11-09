@@ -34,6 +34,7 @@ static UINT         g_hotkeyMods = MOD_CONTROL | MOD_ALT;
 static UINT         g_hotkeyVK   = 'M';
 static std::wstring g_hotkeyName = L"Ctrl+Alt+M";
 static const WCHAR* kIniName     = L"KeyRemap.ini";
+static const WCHAR* kAppVersion  = L"1.0.3";
 
 // 提示框外观：全部按屏幕比例计算，自动适配任意分辨率 / 缩放 / 显示器
 static const double kWidthRatio = 0.29;   // 宽度 = 工作区宽度的 29%
@@ -82,7 +83,10 @@ static const WCHAR* kShiftSym[12] = {
 
 enum {
     TIMER_TOAST = 1,
-    WM_TRAYMSG  = WM_APP + 1,
+    TIMER_HEARTBEAT,
+    TIMER_RECOVER,
+    WM_TRAYMSG   = WM_APP + 1,
+    WM_SHOWTOAST = WM_APP + 2,
     IDM_TOGGLE  = 1000,
     IDM_EXIT    = 1001,
     IDM_SETTINGS = 1002,
@@ -105,6 +109,25 @@ static std::wstring g_lastToastText;
 
 static NOTIFYICONDATAW g_nid = {};
 static HWND  g_hDlg = nullptr;         // 热键设置窗口（非空表示正在设置）
+
+// ---- 钩子存活检测 ----
+// Windows 会静默摘除低级钩子（回调超时 / 省电节流），且不发送任何通知。
+// 这里定期注入一个几乎无人使用的 F24 按键当"心跳"：钩子活着就吞掉它，
+// 连续多次没被钩子看到就说明钩子已死，立即重装。
+static const UINT      kHeartbeatIntervalMs = 4000;
+static ULONGLONG g_lastHookEventTick = 0;   // 钩子最近一次收到事件（含心跳）的时刻
+static ULONGLONG g_lastHeartbeatTick = 0;   // 最近一次发出心跳的时刻
+static bool      g_lastHeartbeatSent = false; // 上次心跳注入是否真的进了系统输入队列
+static int       g_missedHeartbeats  = 0;
+static bool      g_sessionLocked     = false;
+
+// 钩子里只记录待显示的提示，真正的 GDI+ 绘制交给消息循环。
+// 低级钩子回调必须在 LowLevelHooksTimeout（默认 300ms）内返回，
+// 否则 Windows 会静默摘掉钩子且不通知程序 —— 刚唤醒时 DWM 很忙，
+// 在回调里直接 UpdateLayeredWindow 正是最容易超时的点。
+static std::wstring g_pendingToastText;
+static int          g_pendingHoldKey = 0;
+static UINT         g_pendingMode    = 0;
 
 // 修饰键的物理状态，由键盘钩子维护。
 // 钩子位于输入最前端，能拿到"按键发生那一刻"的真实状态；
@@ -187,6 +210,10 @@ static void SaveConfig() {
 // 从而既能避免死循环，又不会误伤其他程序（宏工具、输入法等）注入的按键
 static const ULONG_PTR kInjectedTag = 0x1A2B3C4D;
 
+// 心跳标记：与普通注入区分开，钩子里专门识别并吞掉
+static const ULONG_PTR kHeartbeatTag = 0x1A2B3C4E;
+static const int       kHeartbeatVK  = VK_F24;
+
 static void SendKey(int vk, bool isDown) {
     INPUT in = {};
     in.type = INPUT_KEYBOARD;
@@ -195,6 +222,24 @@ static void SendKey(int vk, bool isDown) {
     in.ki.dwFlags = isDown ? 0 : KEYEVENTF_KEYUP;
     in.ki.dwExtraInfo = kInjectedTag;
     SendInput(1, &in, sizeof(INPUT));
+}
+
+// 注入一个带心跳标记的 F24 按下+松开。
+// 钩子活着时会在回调里识别并 return 1 吞掉，任何程序都收不到；
+// 钩子死了则事件直接进系统 —— F24 是保留键，几乎没有程序会响应它。
+static void SendHeartbeat() {
+    INPUT in[2] = {};
+    for (int i = 0; i < 2; ++i) {
+        in[i].type       = INPUT_KEYBOARD;
+        in[i].ki.wVk     = (WORD)kHeartbeatVK;
+        in[i].ki.wScan   = (WORD)MapVirtualKeyW(kHeartbeatVK, MAPVK_VK_TO_VSC);
+        in[i].ki.dwFlags = (i == 0) ? 0 : KEYEVENTF_KEYUP;
+        in[i].ki.dwExtraInfo = kHeartbeatTag;
+    }
+    g_lastHeartbeatTick = GetTickCount64();
+    // 前台是管理员权限窗口时 SendInput 会被 UIPI 拒绝 —— 此时"没收到心跳"
+    // 不能证明钩子已死，只能说明注入没进队列
+    g_lastHeartbeatSent = (SendInput(2, in, sizeof(INPUT)) == 2);
 }
 
 static bool IsModifierKey(UINT vk) {
@@ -553,6 +598,16 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
         return CallNextHookEx(g_hook, nCode, wParam, lParam);
 
     KBDLLHOOKSTRUCT* kb = (KBDLLHOOKSTRUCT*)lParam;
+
+    // 任何进入回调的事件都证明钩子活着、且挂在当前桌面上
+    g_lastHookEventTick = GetTickCount64();
+
+    // 心跳探测键：吞掉，不让它进入系统
+    if (kb->dwExtraInfo == kHeartbeatTag && kb->vkCode == (DWORD)kHeartbeatVK) {
+        g_missedHeartbeats = 0;
+        return 1;
+    }
+
     // 只忽略"我们自己注入"的事件，否则会死循环。
     // 注意不能用 LLKHF_INJECTED 一刀切，那会连带忽略其他程序注入的按键
     if (kb->dwExtraInfo == kInjectedTag)
@@ -619,7 +674,12 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
                         dst = Fmt(L"F%d", i + 1);
                     }
                 }
-                ShowToast(Fmt(L"%s   →   %s", kRowName[i], dst.c_str()), vk, 0);
+                // 不在钩子回调里绘制：只记录内容并投递消息，由消息循环去渲染。
+                // 钩子回调必须远快于 300ms 的 LowLevelHooksTimeout 预算
+                g_pendingToastText = Fmt(L"%s   →   %s", kRowName[i], dst.c_str());
+                g_pendingHoldKey   = vk;
+                g_pendingMode      = (UINT)g_mode;
+                PostMessageW(g_hwnd, WM_SHOWTOAST, 0, 0);
                 break;
             }
         }
@@ -693,6 +753,33 @@ static bool InstallHook() {
     return g_hook != nullptr;
 }
 
+static void ResetModifierState() {
+    // 锁屏/睡眠期间按下的修饰键，其 keyup 可能落在安全桌面上、到不了本程序，
+    // 状态会永久卡在"按住"，使 ModifierBlocksMapping() 把所有按键都放行。
+    g_modCtrl = g_modShift = g_modAlt = g_modWin = false;
+}
+
+// 心跳看门狗：定时检查钩子是否还在收事件，死了就重建
+static void WatchdogTick() {
+    if (g_sessionLocked) return;   // 锁屏时钩子收不到键盘是正常现象
+
+    const ULONGLONG now = GetTickCount64();
+    if (g_lastHeartbeatSent && g_lastHeartbeatTick != 0
+        && g_lastHookEventTick < g_lastHeartbeatTick) {
+        ++g_missedHeartbeats;      // 上次心跳注入之后，钩子一次都没响应
+    } else {
+        g_missedHeartbeats = 0;
+    }
+
+    if (g_missedHeartbeats >= 2) {
+        const bool ok = InstallHook();
+        LogEvent(Fmt(L"hook heartbeat lost -> reinstall hook=%s", ok ? L"ok" : L"FAILED"));
+        g_missedHeartbeats  = 0;
+        g_lastHookEventTick = now;
+    }
+    SendHeartbeat();
+}
+
 // 唤醒 / 解锁后调用：把输入通道整个重建一遍
 static void RecoverInput(const wchar_t* reason) {
     const bool hookOk = InstallHook();
@@ -701,6 +788,12 @@ static void RecoverInput(const wchar_t* reason) {
     // 按住状态可能已经和现实脱节，清掉并把补发的 keyup 放掉
     for (auto& kv : g_held) SendKey(kv.second, false);
     g_held.clear();
+
+    // 修饰键状态同理：锁屏期间松开的键，keyup 到不了本程序
+    ResetModifierState();
+    HideToast();
+    g_missedHeartbeats  = 0;
+    g_lastHookEventTick = GetTickCount64();
 
     LogEvent(Fmt(L"%s -> hook=%s hotkey=%s", reason,
                  hookOk ? L"ok" : L"FAILED", hotkeyOk ? L"ok" : L"FAILED"));
@@ -724,8 +817,21 @@ static LRESULT CALLBACK MsgWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         else if (LOWORD(lp) == WM_LBUTTONDBLCLK) CycleMode();
         return 0;
 
+    // 钩子投递过来的提示：真正的绘制放到这里，避免钩子回调超时
+    case WM_SHOWTOAST:
+        if ((UINT)g_mode != g_pendingMode) return 0;
+        if (g_pendingHoldKey != 0 && g_held.find(g_pendingHoldKey) == g_held.end())
+            return 0;      // 键已松开，提示已过时
+        ShowToast(g_pendingToastText, g_pendingHoldKey, 0);
+        return 0;
+
     case WM_TIMER:
         if (wp == TIMER_TOAST) HideToast();
+        else if (wp == TIMER_HEARTBEAT) WatchdogTick();
+        else if (wp == TIMER_RECOVER) {
+            KillTimer(h, TIMER_RECOVER);
+            RecoverInput(L"delayed recover");
+        }
         return 0;
 
     // ---- 睡眠/唤醒 ----
@@ -736,6 +842,8 @@ static LRESULT CALLBACK MsgWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         case PBT_APMRESUMESUSPEND:
         case PBT_APMRESUMECRITICAL:
             RecoverInput(L"resume from sleep");
+            // 桌面切换可能有延迟，1.5 秒后再补一次重建
+            SetTimer(g_hwnd, TIMER_RECOVER, 1500, nullptr);
             break;
         }
         return TRUE;
@@ -745,10 +853,23 @@ static LRESULT CALLBACK MsgWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_WTSSESSION_CHANGE:
         switch (wp) {
         case WTS_SESSION_UNLOCK:
+            g_sessionLocked = false;
             RecoverInput(L"session unlock");
+            SetTimer(g_hwnd, TIMER_HEARTBEAT, kHeartbeatIntervalMs, nullptr);
+            SetTimer(g_hwnd, TIMER_RECOVER, 1500, nullptr);
+            break;
+        case WTS_SESSION_LOCK:
+            // 锁屏后本程序的桌面收不到键盘输入，暂停心跳，免得误判钩子已死
+            g_sessionLocked = true;
+            ResetModifierState();
+            KillTimer(g_hwnd, TIMER_HEARTBEAT);
+            KillTimer(g_hwnd, TIMER_RECOVER);
+            HideToast();
             break;
         case WTS_CONSOLE_CONNECT:
+            g_sessionLocked = false;
             RecoverInput(L"console connect");
+            SetTimer(g_hwnd, TIMER_HEARTBEAT, kHeartbeatIntervalMs, nullptr);
             break;
         }
         return 0;
@@ -841,6 +962,11 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
         MessageBoxW(nullptr, L"安装键盘钩子失败，程序退出。", L"KeyRemap", MB_ICONERROR);
         return 1;
     }
+    g_lastHookEventTick = GetTickCount64();
+
+    // 心跳看门狗：钩子被系统静默摘除后能自动发现并重建
+    SetTimer(g_hwnd, TIMER_HEARTBEAT, kHeartbeatIntervalMs, nullptr);
+    LogEvent(Fmt(L"startup v%s", kAppVersion));
 
     SetMode(MODE_NORMAL);
     ShowToast(Fmt(L"正常模式 · %s 切换", g_hotkeyName.c_str()), 0, 2200);
